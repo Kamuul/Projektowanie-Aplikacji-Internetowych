@@ -1,0 +1,2 @@
+wwwroot\index.html
+C:\projekt\TelemetryFrontApi\wwwroot\index.html
