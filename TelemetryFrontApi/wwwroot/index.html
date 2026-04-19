@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alerty</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1e1e1e;
+            color: #fff;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #00d2ff;
+        }
+
+        .alert-box {
+            background-color: #ff4757;
+            color: white;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(-100%);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        #connectionStatus {
+            color: #2ed573;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+
+
+    <h3>Alerty:</h3>
+    <div id="alertsContainer">
+    </div>
+
+    <script>
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl("/telemetryHub")
+            .withAutomaticReconnect()
+            .build();
+
+        connection.on("ReceiveAlert", function (message) {
+            const container = document.getElementById("alertsContainer");
+            const newAlert = document.createElement("div");
+            newAlert.className = "alert-box";
+
+            const time = new Date().toLocaleTimeString();
+            newAlert.innerHTML = `<strong>[${time}]</strong> ${message}`;
+
+            container.prepend(newAlert);
+        });
+
+        connection.start().then(function () {
+            document.getElementById("connectionStatus").innerHTML = "🟢 Połączono (Nasłuchiwanie na żywo)";
+        }).catch(function (err) {
+            document.getElementById("connectionStatus").innerHTML = "🔴 Błąd połączenia: " + err.toString();
+            console.error(err.toString());
+        });</script>
+
+</body>
+</html>
