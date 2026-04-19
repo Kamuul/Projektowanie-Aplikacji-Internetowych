@@ -71,9 +71,9 @@
         });
 
         connection.start().then(function () {
-            document.getElementById("connectionStatus").innerHTML = "🟢 Połączono (Nasłuchiwanie na żywo)";
+            document.getElementById("connectionStatus").innerHTML = "Połączono (Nasłuchiwanie na żywo)";
         }).catch(function (err) {
-            document.getElementById("connectionStatus").innerHTML = "🔴 Błąd połączenia: " + err.toString();
+            document.getElementById("connectionStatus").innerHTML = "Błąd połączenia: " + err.toString();
             console.error(err.toString());
         });</script>
 
