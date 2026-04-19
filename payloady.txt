@@ -1,0 +1,13 @@
+Body data
+{
+  "deviceId": "sensor-${__Random(1,20)}",
+  "timestamp": "${__time(yyyy-MM-dd'T'HH:mm:ss.SSS'Z')}",
+  "payloadBase64": "${__V(payload_${__Random(1,5)})}"
+}
+
+User defined variables
+payload_1 = eyJ0ZW1wZXJhdHVyZSI6IDE4LjB9
+payload_2 = eyJ0ZW1wZXJhdHVyZSI6IDE4LjB9
+payload_3 = eyJ0ZW1wZXJhdHVyZSI6IDE4LjB9
+payload_4 = eyJ0ZW1wZXJhdHVyZSI6IDE4LjB9
+payload_5 = eyJ0ZW1wZXJhdHVyZSI6IDM1LjB9

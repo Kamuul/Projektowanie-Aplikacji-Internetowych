@@ -1,0 +1,394 @@
+program.cs 
+
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.ObjectPool;
+using RabbitMQ.Client;
+using Microsoft.AspNetCore.SignalR;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddSignalR();
+
+builder.Services.AddSingleton<IConnection>(sp =>
+{
+    var factory = new ConnectionFactory()
+    {
+        Uri = new Uri("amqps://gxwrqojv:9szEPXUDXCmRug8A9jmXs_iXHRRSDbaR@goose.rmq2.cloudamqp.com/gxwrqojv"),
+        DispatchConsumersAsync = true
+    };
+    return factory.CreateConnection();
+});
+
+builder.Services.AddSingleton<IRabbitMqPublisher, RabbitMqPublisher>();
+builder.Services.AddHostedService<TelemetryWorker>();
+
+var app = builder.Build();
+
+app.UseMiddleware<RequestLoggingMiddleware>();
+
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
+app.MapControllers();
+app.MapHub<TelemetryHub>("/telemetryHub"); 
+
+
+app.Run();
+
+
+
+
+public class TelemetryHub : Hub
+{
+}
+
+
+
+public class TelemetryRequest
+{
+    public string DeviceId { get; set; } = string.Empty;
+    public DateTime Timestamp { get; set; }
+    public string PayloadBase64 { get; set; } = string.Empty;
+}
+
+
+
+public class RequestLoggingMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger<RequestLoggingMiddleware> _logger;
+
+    public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        context.Request.EnableBuffering();
+        using var reader = new StreamReader(
+            context.Request.Body, Encoding.UTF8, false, 1024, true);
+
+        var requestBody = await reader.ReadToEndAsync();
+        context.Request.Body.Position = 0;
+
+        _logger.LogInformation("Otrzymano żądanie: {Method} {Path} | Body: {Body}",
+            context.Request.Method, context.Request.Path, requestBody);
+
+        await _next(context);
+    }
+}
+
+
+
+public class RabbitMqChannelPolicy : IPooledObjectPolicy<IModel>
+{
+    private readonly IConnection _connection;
+    public RabbitMqChannelPolicy(IConnection connection) => _connection = connection;
+    public IModel Create() => _connection.CreateModel();
+    public bool Return(IModel obj)
+    {
+        if (obj.IsOpen) return true;
+        obj.Dispose();
+        return false;
+    }
+}
+
+public interface IRabbitMqPublisher
+{
+    void PublishTelemetry(string routingKey, object message);
+}
+
+public class RabbitMqPublisher : IRabbitMqPublisher
+{
+    private readonly DefaultObjectPool<IModel> _channelPool;
+    private const string ExchangeName = "telemetry_exchange";
+
+    public RabbitMqPublisher(IConnection connection)
+    {
+        var policy = new RabbitMqChannelPolicy(connection);
+        _channelPool = new DefaultObjectPool<IModel>(policy, maximumRetained: 50);
+
+        using var channel = connection.CreateModel();
+        channel.ExchangeDeclare(ExchangeName, "topic", true);
+    }
+
+    public void PublishTelemetry(string routingKey, object message)
+    {
+        var channel = _channelPool.Get();
+        try
+        {
+            var json = JsonSerializer.Serialize(message);
+            var body = Encoding.UTF8.GetBytes(json);
+            var properties = channel.CreateBasicProperties();
+            properties.Persistent = true;
+
+            channel.BasicPublish(ExchangeName, routingKey, false, properties, body);
+        }
+        finally
+        {
+            _channelPool.Return(channel);
+        }
+    }
+}
+
+[ApiController]
+[Route("api/[controller]")]
+public class TelemetryController : ControllerBase
+{
+    private readonly IRabbitMqPublisher _publisher;
+    private readonly ILogger<TelemetryController> _logger;
+
+    public TelemetryController(IRabbitMqPublisher publisher, ILogger<TelemetryController> logger)
+    {
+        _publisher = publisher;
+        _logger = logger;
+    }
+
+    [HttpPost("ingest")]
+    public IActionResult IngestData([FromBody] TelemetryRequest request)
+    {
+        try
+        {
+            var base64EncodedBytes = Convert.FromBase64String(request.PayloadBase64);
+            var decodedPayloadJson = Encoding.UTF8.GetString(base64EncodedBytes);
+
+            var messageToPublish = new
+            {
+                DeviceId = request.DeviceId,
+                Timestamp = request.Timestamp,
+                DecodedData = decodedPayloadJson
+            };
+
+            string routingKey = $"telemetry.{request.DeviceId}";
+            _publisher.PublishTelemetry(routingKey, messageToPublish);
+
+            return Accepted(new { Message = "Dane przyjęte i przekazane do przetworzenia." });
+        }
+        catch (FormatException)
+        {
+            return BadRequest(new { Error = "Nieprawidłowy format Base64 w polu PayloadBase64." });
+        }
+    }
+}
+
+worker.cs
+
+using System;
+using System.Collections.Generic; // DODANE dla Dictionary
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.SignalR;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using InfluxDB.Client;
+using InfluxDB.Client.Api.Domain;
+using InfluxDB.Client.Writes;
+
+public class TelemetryWorker : BackgroundService
+{
+    private readonly IConnection _rabbitConnection;
+    private readonly ILogger<TelemetryWorker> _logger;
+    private readonly IHubContext<TelemetryHub> _hubContext;
+    private IModel? _channel;
+    private readonly Dictionary<string, DateTime> _lastAlertTimes = new Dictionary<string, DateTime>();
+    private readonly TimeSpan _alertInterval = TimeSpan.FromSeconds(30);
+
+    private const string InfluxUrl = "https://eu-central-1-1.aws.cloud2.influxdata.com";
+    private const string InfluxToken = "FEVCx1wLyMwT1rc5yp79TTK5Zz60MLwcCEciennMPU8BXAS8704s98BqBUjXkTQ50CgAfIUIaQ7MMdjI9Z3zHA==";
+    private const string InfluxOrg = "tak";
+    private const string InfluxBucket = "system-telemetryczny";
+
+    public TelemetryWorker(IConnection rabbitConnection, ILogger<TelemetryWorker> logger, IHubContext<TelemetryHub> hubContext)
+    {
+        _rabbitConnection = rabbitConnection;
+        _logger = logger;
+        _hubContext = hubContext;
+    }
+
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Uruchamianie Workera nasłuchującego na dane z RabbitMQ...");
+
+        _channel = _rabbitConnection.CreateModel();
+        _channel.ExchangeDeclare("telemetry_exchange", "topic", true);
+
+        string queueName = "telemetry_to_influx_queue";
+        _channel.QueueDeclare(queueName, true, false, false, null);
+        _channel.QueueBind(queueName, "telemetry_exchange", "telemetry.*", null);
+
+        var consumer = new AsyncEventingBasicConsumer(_channel);
+        consumer.Received += async (model, ea) =>
+        {
+            var body = ea.Body.ToArray();
+            var messageString = Encoding.UTF8.GetString(body);
+
+            try
+            {
+                await Task.Yield();
+                await WriteToInfluxDbAsync(messageString);
+
+                using var doc = JsonDocument.Parse(messageString);
+                var deviceId = doc.RootElement.GetProperty("DeviceId").GetString() ?? "unknown";
+                var decodedDataString = doc.RootElement.GetProperty("DecodedData").GetString();
+
+                if (!string.IsNullOrWhiteSpace(decodedDataString))
+                {
+                    using var innerDoc = JsonDocument.Parse(decodedDataString);
+                    if (innerDoc.RootElement.TryGetProperty("temperature", out var tempElement))
+                    {
+                        var temp = tempElement.GetDouble();
+                        if (temp > 20.0)
+                        {
+                            bool canSendAlert = true;
+
+                            if (_lastAlertTimes.TryGetValue(deviceId, out DateTime lastAlert))
+                            {
+                                if (DateTime.UtcNow - lastAlert < _alertInterval)
+                                {
+                                    canSendAlert = false; 
+                                }
+                            }
+
+                            if (canSendAlert)
+                            {
+                                _lastAlertTimes[deviceId] = DateTime.UtcNow;
+
+                                var alertMessage = $"[ALERT] Urzadzenie {deviceId} odnotowalo wysoką temperaturę: {temp} C!";
+                                _logger.LogWarning(alertMessage);
+                                await _hubContext.Clients.All.SendAsync("ReceiveAlert", alertMessage);
+                            }
+                        }
+                    }
+                }
+
+                _channel.BasicAck(ea.DeliveryTag, false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Worker] Błąd podczas przetwarzania wiadomości.");
+                _channel.BasicNack(ea.DeliveryTag, false, false); 
+            }
+        };
+
+        _channel.BasicConsume(queueName, false, "", false, false, null, consumer);
+        return Task.CompletedTask;
+    }
+
+    private async Task WriteToInfluxDbAsync(string jsonMessage)
+    {
+        using var client = new InfluxDBClient(InfluxUrl, InfluxToken);
+        var writeApi = client.GetWriteApiAsync();
+
+        using var doc = JsonDocument.Parse(jsonMessage);
+        var deviceId = doc.RootElement.GetProperty("DeviceId").GetString();
+
+        var point = PointData
+            .Measurement("sensor_telemetry")
+            .Tag("device_id", deviceId)
+            .Field("received_status", 1)
+            .Timestamp(DateTime.UtcNow, WritePrecision.Ns);
+
+        await writeApi.WritePointAsync(point, InfluxBucket, InfluxOrg);
+        _logger.LogInformation("[Worker] Zapisano punkt pomiarowy do InfluxDB");
+    }
+
+    public override void Dispose()
+    {
+        _channel?.Dispose();
+        base.Dispose();
+    }
+}
+
+index.html
+
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alerty</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1e1e1e;
+            color: #fff;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #00d2ff;
+        }
+
+        .alert-box {
+            background-color: #ff4757;
+            color: white;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(-100%);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        #connectionStatus {
+            color: #2ed573;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+
+
+    <h3>Alerty:</h3>
+    <div id="alertsContainer">
+    </div>
+
+    <script>
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl("/telemetryHub")
+            .withAutomaticReconnect()
+            .build();
+
+        connection.on("ReceiveAlert", function (message) {
+            const container = document.getElementById("alertsContainer");
+            const newAlert = document.createElement("div");
+            newAlert.className = "alert-box";
+
+            const time = new Date().toLocaleTimeString();
+            newAlert.innerHTML = `<strong>[${time}]</strong> ${message}`;
+
+            container.prepend(newAlert);
+        });
+
+        connection.start().then(function () {
+            document.getElementById("connectionStatus").innerHTML = "Połączono (Nasłuchiwanie na żywo)";
+        }).catch(function (err) {
+            document.getElementById("connectionStatus").innerHTML = "Błąd połączenia: " + err.toString();
+            console.error(err.toString());
+        });</script>
+
+</body>
+</html>
